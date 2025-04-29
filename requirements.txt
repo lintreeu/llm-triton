@@ -1,0 +1,2 @@
+sentencepiece>=0.1.99
+numpy>=1.26

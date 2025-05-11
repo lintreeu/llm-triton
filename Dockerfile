@@ -1,4 +1,4 @@
-# 使用 Ubuntu 22.04 + CUDA 11.5 的官方開發 image
+# 使用 Ubuntu 22.04 + CUDA 12.8 的官方開發 image
 FROM pytorch/pytorch:2.7.0-cuda12.8-cudnn9-devel
 
 # 設定環境變數

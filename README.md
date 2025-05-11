@@ -1,5 +1,5 @@
 
-# 🐉 **Llama-Triton** 
+# **Llama-Triton** 
 
 
 > **Llama-Triton** 是將 `llama.cpp` 核心以 **Python + Triton** 重寫的專案，支援 FP16 推理、Page Attention、Rotary Embedding 與多 GPU 分層；容易 hack、易於學習，適合想深入研究 LLM 推理核心或客製化 GPU kernels 的開發者。
@@ -19,7 +19,7 @@
 
 ## 功能說明
 
-| 🎯 功能 | 說明 |
+| 功能 | 說明 |
 |---------|------|
 | **Triton Kernels** | GEMM、Page Attention、RMSNorm 全以 Triton 撰寫，一鍵自動調優。 |
 | **Page Attention** | 以「頁」為單位管理 KV-Cache，長序列推理顯著節省 GPU 記憶體。 |

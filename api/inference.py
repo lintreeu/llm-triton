@@ -1,11 +1,10 @@
-"""Llama text-generation utility built on Triton-accelerated inference.
+"""api.inference
 
-The generator
+Llama-Triton 文字生成介面：
+    • 支援 native Triton 權重 (state_dict.pt + model.json)
+    • 支援 Hugging Face 檢查點 (需使用 fmt="hf" 明確指定)
 
-1. Loads a model configuration (`model.json`) and tokenizer.
-2. Restores weights from `state_dict.pt` if available.
-3. Performs autoregressive decoding with temperature + nucleus sampling.
-
+不再自動推斷格式——由使用者決定。
 """
 
 from __future__ import annotations
@@ -19,90 +18,107 @@ from graph.config import LlamaConfig
 from graph.model import LlamaTritonModel
 from tokenizer.sentencepiece_tokenizer import SentencePieceTokenizer
 
+# optional HF converter
+try:
+    from utils.hf_import import convert as hf_convert
+except ModuleNotFoundError:
+    hf_convert = None
+
 
 class LlamaGenerator:
-    """High-level wrapper for prompt-based text generation."""
+    """Prompt-based text generator without implicit auto-convert."""
 
     def __init__(
         self,
         model_dir: str | Path,
+        *,
+        fmt: str = "triton",          # "triton" | "hf"
         device: str | torch.device = "cuda",
+        dtype: str | None = None,     # override dtype if needed
     ) -> None:
-        model_dir = Path(model_dir)
+        """初始化
 
-        self.config: LlamaConfig = LlamaConfig.from_json(model_dir / "model.json")
-        self.tokenizer = SentencePieceTokenizer(model_dir / "tokenizer.model")
+        Args
+        ----
+        model_dir :  權重資料夾。
+        fmt       :  "triton" → 直接載入；"hf" → 轉換後載入。
+        device    :  CUDA / CPU 等。
+        dtype     :  強制覆寫 config.torch_dtype (e.g. "bfloat16")。
+        """
+        self.model_dir = Path(model_dir)
+        self.device = torch.device(device)
+        self.fmt = fmt.lower()
 
-        self.model = LlamaTritonModel(self.config, device=device)
+        if self.fmt not in {"triton", "hf"}:
+            raise ValueError('`fmt` 必須是 "triton" 或 "hf"')
 
-        state_dict_path = model_dir / "state_dict.pt"
-        if state_dict_path.exists():
-            self.model.load_state_dict(
-                torch.load(state_dict_path, map_location=device),
-                strict=False,
-            )
+        if self.fmt == "hf":
+            if hf_convert is None:
+                raise ImportError("未安裝 utils.hf_import，無法處理 Hugging Face 權重。")
+            hf_convert(self.model_dir, target_dtype=dtype or "float16")
 
-        self.model.eval()  # Switch to inference mode.
+        # ─────────────────── 讀 config / tokenizer ─────────────────── #
+        cfg_path = self.model_dir / "model.json"
+        if not cfg_path.exists():
+            raise FileNotFoundError("找不到 model.json，請確認 fmt 與資料夾內容。")
+
+        self.config: LlamaConfig = LlamaConfig.from_json(cfg_path)
+        if dtype is not None:
+            self.config.torch_dtype = dtype
+
+        tok_path = self.model_dir / "tokenizer.model"
+        if not tok_path.exists():
+            raise FileNotFoundError("缺少 tokenizer.model (SentencePiece)")
+        self.tokenizer = SentencePieceTokenizer(tok_path)
+
+        # ─────────────────── 載入 state_dict ─────────────────── #
+        sd_path = self.model_dir / "state_dict.pt"
+        if not sd_path.exists():
+            raise FileNotFoundError("state_dict.pt 不存在，無法載入權重。")
+
+        self.model = LlamaTritonModel(self.config, device=self.device)
+        self.model.load_state_dict(
+            torch.load(sd_path, map_location=self.device), strict=False
+        )
+        self.model.eval()
+
+        eos_ids = self.config.eos_token_id
+        self.eos_ids = eos_ids if isinstance(eos_ids, list) else [eos_ids]
 
     # ------------------------------------------------------------------ #
-    # Public API                                                         #
+    # Generation                                                         #
     # ------------------------------------------------------------------ #
-
     @torch.no_grad()
     def generate(
         self,
         prompt: str,
+        *,
         max_new_tokens: int = 32,
         temperature: float = 0.8,
         top_p: float = 0.9,
     ) -> str:
-        """Generate text continuations for a given prompt.
-
-        Args:
-            prompt: Input text prompt.
-            max_new_tokens: Maximum number of tokens to generate.
-            temperature: Softmax temperature (> 0).  Higher = more randomness.
-            top_p: Nucleus-sampling threshold (0 < top_p ≤ 1).
-
-        Returns:
-            The generated text (without the prompt).
-        """
-        # Encode prompt and prime the model / KV cache.
+        """以 nucleus + temperature sampling 產生續句。"""
         prompt_ids: List[int] = self.tokenizer.encode(
-            prompt,
-            add_bos=True,
-            add_eos=False,
+            prompt, add_bos=True, add_eos=False
         )
-        input_ids = torch.tensor(prompt_ids, device=self.model.device)
-        _ = self.model(input_ids)  # Warm-up forward pass.
+        input_ids = torch.tensor(prompt_ids, device=self.device)
+        _ = self.model(input_ids)  # prime KV-cache
 
-        current_token: int = prompt_ids[-1]
-        generated_ids: List[int] = []
+        cur = prompt_ids[-1]
+        out_ids: List[int] = []
 
         for _ in range(max_new_tokens):
-            logits = self.model(
-                torch.tensor([current_token], device=self.model.device)
-            ) / temperature
-
+            logits = self.model(torch.tensor([cur], device=self.device)) / temperature
             probs = torch.softmax(logits, dim=-1)
 
-            # Nucleus (top-p) sampling.
             sorted_idx = torch.argsort(probs, descending=True)
-            cumulative = torch.cumsum(probs[sorted_idx], dim=0)
-            kept_idx = sorted_idx[cumulative <= top_p]
+            cumulative = torch.cumsum(probs[sorted_idx], 0)
+            kept = sorted_idx[cumulative <= top_p]
+            kept = kept if kept.numel() else sorted_idx[:1]
 
-            # Edge case: ensure at least one token is kept.
-            if kept_idx.numel() == 0:
-                kept_idx = sorted_idx[:1]
-
-            current_token = kept_idx[
-                torch.multinomial(probs[kept_idx], num_samples=1)
-            ].item()
-
-            # Stop if EOS token is produced.
-            if current_token == self.tokenizer.eos_id:
+            cur = kept[torch.multinomial(probs[kept], 1)].item()
+            if cur in self.eos_ids:
                 break
+            out_ids.append(cur)
 
-            generated_ids.append(current_token)
-
-        return self.tokenizer.decode(generated_ids)
+        return self.tokenizer.decode(out_ids)
